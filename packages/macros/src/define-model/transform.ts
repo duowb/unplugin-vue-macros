@@ -6,6 +6,7 @@ import {
   DEFINE_MODEL,
   DEFINE_OPTIONS,
   DEFINE_PROPS,
+  REPO_ISSUE_URL,
   isCallOf,
   parseSFC,
 } from '@vue-macros/common'
@@ -13,6 +14,7 @@ import type {
   Identifier,
   LVal,
   Node,
+  ObjectExpression,
   ObjectPattern,
   ObjectProperty,
   Program,
@@ -39,10 +41,7 @@ export const transformDefineModel = (
   let modelDeclKind: string | undefined
   let modelDestructureDecl: ObjectPattern | undefined
   const modelIdentifiers = new Set<Identifier>()
-  const v2Model: {
-    event: string
-    prop: string
-  } = { prop: '', event: '' }
+  const modelVue2: { event: string; prop: string } = { prop: '', event: '' }
 
   function processDefinePropsOrEmits(node: Node, declId?: LVal) {
     let type: 'props' | 'emits'
@@ -60,13 +59,13 @@ export const transformDefineModel = (
 
     if (node.arguments[0])
       throw new SyntaxError(
-        `Error: ${fnName}() cannot accept non-type arguments when used with ${DEFINE_MODEL}()`
+        `${fnName}() cannot accept non-type arguments when used with ${DEFINE_MODEL}()`
       )
 
     const typeDeclRaw = node.typeParameters?.params?.[0]
     if (!typeDeclRaw)
       throw new SyntaxError(
-        `Error: ${fnName}() expected a type parameter when used with ${DEFINE_MODEL}.`
+        `${fnName}() expected a type parameter when used with ${DEFINE_MODEL}.`
       )
 
     const typeDecl = resolveQualifiedType(
@@ -75,7 +74,7 @@ export const transformDefineModel = (
     ) as TSTypeLiteral | TSInterfaceBody | undefined
 
     if (!typeDecl) {
-      throw new Error(
+      throw new SyntaxError(
         `type argument passed to ${fnName}() must be a literal type, ` +
           `or a reference to an interface or literal type.`
       )
@@ -114,7 +113,7 @@ export const transformDefineModel = (
 
     const propsTypeDeclRaw = node.typeParameters?.params[0]
     if (!propsTypeDeclRaw) {
-      throw new SyntaxError('Error: 1')
+      throw new SyntaxError(`expected a type parameter for ${DEFINE_MODEL}.`)
     }
     modelTypeDecl = resolveQualifiedType(
       propsTypeDeclRaw,
@@ -122,7 +121,7 @@ export const transformDefineModel = (
     ) as TSTypeLiteral | TSInterfaceBody | undefined
 
     if (!modelTypeDecl) {
-      throw new Error(
+      throw new SyntaxError(
         `type argument passed to ${DEFINE_MODEL}() must be a literal type, ` +
           `or a reference to an interface or literal type.`
       )
@@ -136,7 +135,7 @@ export const transformDefineModel = (
         modelDestructureDecl = declId
         for (const property of declId.properties) {
           if (property.type === 'RestElement') {
-            throw new SyntaxError('not supported')
+            throw new SyntaxError('rest element is not supported')
           }
         }
       } else {
@@ -187,6 +186,46 @@ export const transformDefineModel = (
       }
     }
     return false
+  }
+
+  function processDefineOptions(node: Node) {
+    if (!isCallOf(node, DEFINE_OPTIONS)) return false
+
+    const [arg] = node.arguments
+    if (arg) processVue2Model(arg)
+
+    return true
+  }
+
+  function processVue2Model(node: Node) {
+    // model: {
+    //   prop: 'checked',
+    //   event: 'change'
+    // }
+    if (node.type !== 'ObjectExpression') return false
+
+    const model = node.properties.find(
+      (prop) =>
+        prop.type === 'ObjectProperty' &&
+        prop.key.type === 'Identifier' &&
+        prop.key.name === 'model' &&
+        prop.value.type === 'ObjectExpression' &&
+        prop.value.properties.length === 2
+    ) as ObjectProperty
+
+    if (!model) return false
+    ;(model.value as ObjectExpression).properties.forEach((propertyItem) => {
+      if (
+        propertyItem.type === 'ObjectProperty' &&
+        propertyItem.key.type === 'Identifier' &&
+        propertyItem.value.type === 'StringLiteral' &&
+        ['prop', 'event'].includes(propertyItem.key.name)
+      ) {
+        const key = propertyItem.key.name as 'prop' | 'event'
+        modelVue2[key] = propertyItem.value.value
+      }
+    })
+    return true
   }
 
   function resolveQualifiedType(
@@ -249,8 +288,8 @@ export const transformDefineModel = (
 
   function getEventKey(key: string) {
     if (version === 2) {
-      if (v2Model.prop === key) {
-        return v2Model.event
+      if (modelVue2.prop === key) {
+        return modelVue2.event
       } else if (key === 'value') {
         return 'input'
       }
@@ -258,8 +297,11 @@ export const transformDefineModel = (
     return `update:${key}`
   }
 
-  function processEmitValue() {
-    if (!emitsIdentifier) throw new Error('Error: 4')
+  function processAssignModelVariable() {
+    if (!emitsIdentifier)
+      throw new Error(
+        `Identifier of returning value of ${DEFINE_EMITS} is not found, please report this issue.\n${REPO_ISSUE_URL}`
+      )
 
     const program: Program = {
       type: 'Program',
@@ -311,33 +353,44 @@ export const transformDefineModel = (
   }
   const { scriptSetup } = sfc
   const startOffset = scriptSetup.loc.start.offset
-  // const endOffset = scriptSetup.loc.end.offset
 
   const s = new MagicString(code)
-  if (scriptSetup.scriptAst && scriptSetup.scriptAst.length > 0) {
+
+  if (
+    version === 2 &&
+    scriptSetup.scriptAst &&
+    scriptSetup.scriptAst.length > 0
+  ) {
+    // process normal <script>
     for (const node of scriptSetup.scriptAst as Statement[]) {
       if (node.type === 'ExportDefaultDeclaration') {
-        const declaration = node.declaration
+        const { declaration } = node
         if (declaration.type === 'ObjectExpression') {
-          processV2Model(declaration)
+          processVue2Model(declaration)
         } else if (
           declaration.type === 'CallExpression' &&
           declaration.callee.type === 'Identifier' &&
           declaration.callee.name === 'defineComponent'
         ) {
-          declaration.arguments.forEach((item) => {
-            if (item.type === 'ObjectExpression') {
-              processV2Model(item)
+          declaration.arguments.forEach((arg) => {
+            if (arg.type === 'ObjectExpression') {
+              processVue2Model(arg)
             }
           })
         }
       }
     }
   }
+
+  // process <script setup>
   for (const node of scriptSetup.scriptSetupAst as Statement[]) {
     if (node.type === 'ExpressionStatement') {
       processDefinePropsOrEmits(node.expression)
-      processDefineOptionIsModel(node.expression)
+
+      if (version === 2) {
+        processDefineOptions(node.expression)
+      }
+
       if (processDefineModel(node.expression)) {
         s.remove(node.start! + startOffset, node.end! + startOffset)
       }
@@ -431,7 +484,7 @@ export const transformDefineModel = (
   }
 
   if (hasDefineModel) {
-    processEmitValue()
+    processAssignModelVariable()
   }
 
   return s
